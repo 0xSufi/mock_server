@@ -933,11 +933,8 @@ app.get('/api/veed/status/:operationId', async (req, res) => {
     };
 
     if (status.status === OperationStatus.COMPLETED && status.result) {
-      const localVideoUrl = status.result.localPath
-        ? `http://localhost:${PORT}${status.result.localPath}`
-        : status.result.videoUrl;
-
-      response.videoUrl = localVideoUrl;
+      // Return relative path - frontend should construct full URL based on API origin
+      response.videoUrl = status.result.localPath || status.result.videoUrl;
       response.cdnUrl = status.result.videoUrl;
     }
 
