@@ -260,18 +260,21 @@ class VeedQueue {
   async executeOperation(operation) {
     const service = await getVeedService();
 
-    // Update progress callback
-    const updateProgress = (progress) => {
+    // Update progress callback - will be called by veed-service during generation
+    const onProgress = (progress) => {
       operation.progress = progress;
       operation.updatedAt = Date.now();
     };
 
-    updateProgress('Starting video generation...');
+    onProgress('Starting video generation...');
 
     const result = await service.generateVideo(
       operation.imageUrl,
       operation.prompt,
-      operation.options
+      {
+        ...operation.options,
+        onProgress, // Pass the callback to track progress
+      }
     );
 
     return result;

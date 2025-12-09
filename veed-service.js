@@ -452,7 +452,7 @@ class VeedService {
     if (!this.page) throw new Error('Service not initialized');
     if (!this.isAuthenticated) throw new Error('Not authenticated');
 
-    const { aspectRatio = 'portrait', duration = '5' } = options;
+    const { aspectRatio = 'portrait', duration = '5', onProgress } = options;
 
     console.log('Starting video generation...');
     console.log('Image URL:', imageUrl);
@@ -615,7 +615,7 @@ class VeedService {
 
       // The video element or download link should appear when done
       // We need to wait for the video to be generated - this could take 30-120 seconds
-      const videoResult = await this.waitForVideoResult(180000); // 3 minute timeout
+      const videoResult = await this.waitForVideoResult(180000, onProgress); // 3 minute timeout
 
       return videoResult;
 
@@ -680,13 +680,24 @@ class VeedService {
   }
 
   // Wait for the video result after clicking generate
-  async waitForVideoResult(timeout = 180000) {
+  async waitForVideoResult(timeout = 180000, onProgress = null) {
     const startTime = Date.now();
     let lastProgress = '';
     let lastLogTime = 0;
     let screenshotCount = 0;
 
     console.log(`[waitForVideoResult] Starting wait with ${timeout/1000}s timeout...`);
+
+    // Helper to report progress
+    const reportProgress = (progress) => {
+      if (onProgress && typeof onProgress === 'function') {
+        try {
+          onProgress(progress);
+        } catch (e) {
+          // Ignore callback errors
+        }
+      }
+    };
 
     while (Date.now() - startTime < timeout) {
       const elapsed = Math.floor((Date.now() - startTime) / 1000);
@@ -810,6 +821,9 @@ class VeedService {
           console.log(`[waitForVideoResult] ${elapsed}s - Progress: ${currentProgress}, Videos: ${pageState.videos.length}, Generating: ${pageState.isGenerating}`);
           lastProgress = currentProgress;
           lastLogTime = Date.now();
+
+          // Report progress to callback
+          reportProgress(currentProgress);
         }
 
         // Take periodic screenshots for debugging (every 30 seconds)
