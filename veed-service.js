@@ -683,95 +683,162 @@ class VeedService {
   async waitForVideoResult(timeout = 180000) {
     const startTime = Date.now();
     let lastProgress = '';
-    let lastDebug = '';
+    let lastLogTime = 0;
+    let screenshotCount = 0;
+
+    console.log(`[waitForVideoResult] Starting wait with ${timeout/1000}s timeout...`);
 
     while (Date.now() - startTime < timeout) {
+      const elapsed = Math.floor((Date.now() - startTime) / 1000);
+
       try {
-        // Check for video element - look for ANY video with mp4 src
-        const videoSrc = await this.page.evaluate(() => {
-          // Find all video elements
+        // Comprehensive page state check
+        const pageState = await this.page.evaluate(() => {
+          const result = {
+            videos: [],
+            progress: null,
+            status: null,
+            isGenerating: false,
+            hasError: false,
+            errorText: null,
+            pageText: '',
+          };
+
+          // Find all video elements and their sources
           const videos = document.querySelectorAll('video');
-          for (const video of videos) {
-            // Check direct src attribute
-            if (video.src && video.src.includes('.mp4')) {
-              return video.src;
-            }
-            // Check source children
-            const source = video.querySelector('source');
-            if (source && source.src && source.src.includes('.mp4')) {
-              return source.src;
+          videos.forEach((video, idx) => {
+            const sources = [];
+            if (video.src) sources.push(video.src);
+            video.querySelectorAll('source').forEach(s => {
+              if (s.src) sources.push(s.src);
+            });
+            // Also check currentSrc
+            if (video.currentSrc) sources.push(video.currentSrc);
+
+            result.videos.push({
+              index: idx,
+              sources: [...new Set(sources)],
+              readyState: video.readyState,
+              duration: video.duration,
+            });
+          });
+
+          // Get page text for analysis
+          const bodyText = document.body.innerText || '';
+          result.pageText = bodyText.substring(0, 500);
+
+          // Look for progress percentage
+          const percentMatches = bodyText.match(/(\d+)\s*%/g);
+          if (percentMatches) {
+            result.progress = percentMatches[percentMatches.length - 1]; // Get last percentage
+          }
+
+          // Check for various status indicators
+          const statusKeywords = ['Generating', 'Processing', 'Creating', 'Loading', 'Rendering', 'Queued', 'Starting'];
+          for (const keyword of statusKeywords) {
+            if (bodyText.includes(keyword)) {
+              result.status = keyword;
+              result.isGenerating = true;
+              break;
             }
           }
-          return null;
+
+          // Check for progress bars or loading spinners
+          const progressBar = document.querySelector('[role="progressbar"], [class*="progress"], [class*="Progress"]');
+          if (progressBar) {
+            result.isGenerating = true;
+            const ariaValue = progressBar.getAttribute('aria-valuenow');
+            if (ariaValue) result.progress = ariaValue + '%';
+          }
+
+          // Check for loading/spinner elements
+          const spinner = document.querySelector('[class*="spinner"], [class*="Spinner"], [class*="loading"], [class*="Loading"], svg[class*="animate"]');
+          if (spinner) {
+            result.isGenerating = true;
+          }
+
+          // Check for error states
+          const errorEl = document.querySelector('[role="alert"], [class*="error"], [class*="Error"], [data-testid*="error"]');
+          if (errorEl) {
+            result.hasError = true;
+            result.errorText = errorEl.textContent?.trim().substring(0, 200);
+          }
+
+          // Check for "failed" or "error" in text
+          if (bodyText.toLowerCase().includes('failed') || bodyText.toLowerCase().includes('error occurred')) {
+            result.hasError = true;
+            result.errorText = result.errorText || 'Generation may have failed';
+          }
+
+          return result;
         });
 
-        if (videoSrc && videoSrc.includes('.mp4')) {
-          console.log('Video ready:', videoSrc);
-          await this.takeScreenshot('veed-video-ready.png');
+        // Check for completed video
+        for (const video of pageState.videos) {
+          for (const src of video.sources) {
+            if (src && (src.includes('.mp4') || src.includes('video') || src.includes('blob:'))) {
+              // Found a video source - but make sure it's not a placeholder
+              if (!src.includes('placeholder') && !src.includes('preview')) {
+                console.log(`[waitForVideoResult] Video found after ${elapsed}s:`, src.substring(0, 100));
+                await this.takeScreenshot('veed-video-ready.png');
 
-          // Download the video by clicking the Download button
-          const localPath = await this.downloadVideoWithButton();
+                // Download the video
+                const localPath = await this.downloadVideoWithButton();
 
-          return {
-            success: true,
-            videoUrl: videoSrc,
-            localPath: localPath,
-          };
+                return {
+                  success: true,
+                  videoUrl: src,
+                  localPath: localPath,
+                };
+              }
+            }
+          }
         }
 
-        // Check for progress indicator - look for any percentage text
-        const pageState = await this.page.evaluate(() => {
-          // Look for percentage in various elements
-          const allText = document.body.innerText;
-          const percentMatch = allText.match(/(\d+)%/);
-          const progress = percentMatch ? percentMatch[0] : null;
-
-          // Check if we're still generating (look for loading indicators)
-          const isGenerating = document.body.innerText.includes('Generating') ||
-                              document.querySelector('[class*="progress"]') !== null ||
-                              document.querySelector('[class*="loading"]') !== null;
-
-          // Count video elements for debugging
-          const videoCount = document.querySelectorAll('video').length;
-          const videoSrcs = Array.from(document.querySelectorAll('video')).map(v => v.src).filter(Boolean);
-
-          return { progress, isGenerating, videoCount, videoSrcs };
-        });
-
-        if (pageState.progress && pageState.progress !== lastProgress) {
-          console.log('Generation progress:', pageState.progress);
-          lastProgress = pageState.progress;
+        // Check for errors
+        if (pageState.hasError && pageState.errorText) {
+          console.error(`[waitForVideoResult] Error detected: ${pageState.errorText}`);
+          await this.takeScreenshot('veed-error.png');
+          throw new Error(`Veed error: ${pageState.errorText}`);
         }
 
-        // Debug logging (every 10 seconds)
-        const debugInfo = JSON.stringify({ videos: pageState.videoCount, srcs: pageState.videoSrcs.length });
-        if (debugInfo !== lastDebug && (Date.now() - startTime) % 10000 < 3000) {
-          console.log('Page state:', debugInfo);
-          lastDebug = debugInfo;
+        // Log progress
+        const currentProgress = pageState.progress || pageState.status || 'waiting';
+        const shouldLog = Date.now() - lastLogTime > 5000; // Log every 5 seconds
+
+        if (shouldLog || currentProgress !== lastProgress) {
+          console.log(`[waitForVideoResult] ${elapsed}s - Progress: ${currentProgress}, Videos: ${pageState.videos.length}, Generating: ${pageState.isGenerating}`);
+          lastProgress = currentProgress;
+          lastLogTime = Date.now();
         }
 
-        // Check for error messages
-        const errorMsg = await this.page.evaluate(() => {
-          const error = document.querySelector('[role="alert"], .error-message, [data-testid*="error"]');
-          return error ? error.textContent : null;
-        });
-
-        if (errorMsg) {
-          throw new Error(`Veed error: ${errorMsg}`);
+        // Take periodic screenshots for debugging (every 30 seconds)
+        if (elapsed > 0 && elapsed % 30 === 0 && screenshotCount < elapsed / 30) {
+          screenshotCount = Math.floor(elapsed / 30);
+          await this.takeScreenshot(`veed-progress-${elapsed}s.png`);
+          console.log(`[waitForVideoResult] Screenshot saved: veed-progress-${elapsed}s.png`);
         }
 
-        // Wait and try again (shorter interval for faster detection)
+        // If not generating and no video after 30 seconds, something might be wrong
+        if (elapsed > 30 && !pageState.isGenerating && pageState.videos.length === 0) {
+          console.log(`[waitForVideoResult] Warning: No generation activity detected. Page text: ${pageState.pageText.substring(0, 200)}`);
+        }
+
+        // Wait before next check
         await new Promise(r => setTimeout(r, 2000));
 
       } catch (error) {
         if (error.message.includes('Veed error')) {
           throw error;
         }
+        console.error(`[waitForVideoResult] Check error at ${elapsed}s:`, error.message);
         // Continue waiting
       }
     }
 
-    throw new Error('Video generation timed out');
+    // Timeout - take final screenshot
+    await this.takeScreenshot('veed-timeout.png');
+    throw new Error('Video generation timed out after ' + (timeout/1000) + ' seconds');
   }
 
   async close() {

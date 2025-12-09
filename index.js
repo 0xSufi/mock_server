@@ -6,6 +6,7 @@ import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { SSEClientTransport } from '@modelcontextprotocol/sdk/client/sse.js';
 import { GoogleGenAI } from '@google/genai';
 import { getVeedService, initVeedService } from './veed-service.js';
+import { getVeedQueue, OperationStatus } from './veed-queue.js';
 
 const app = express();
 app.use(cors());
@@ -828,46 +829,20 @@ app.get('/api/veo/health', (req, res) => {
   });
 });
 
-// ============= VEED.io API Endpoints =============
-
-// Store Veed service state
-let veedServiceReady = false;
-let veedInitializing = false;
-
-// Initialize Veed service on startup (async, non-blocking)
-async function initializeVeedService() {
-  if (veedInitializing) return;
-  veedInitializing = true;
-
-  try {
-    console.log('Initializing Veed.io service...');
-    veedServiceReady = await initVeedService();
-    console.log('Veed.io service ready:', veedServiceReady);
-  } catch (error) {
-    console.error('Failed to initialize Veed.io service:', error.message);
-    veedServiceReady = false;
-  }
-  veedInitializing = false;
-}
+// ============= VEED.io API Endpoints (with Queue Support) =============
 
 // Veed health check
 app.get('/api/veed/health', async (req, res) => {
   try {
-    const service = await getVeedService();
-    const status = await service.getAuthStatus();
-
-    res.json({
-      available: veedServiceReady,
-      authenticated: status.authenticated,
-      browserConnected: status.browserConnected,
-      initializing: veedInitializing,
-    });
+    const queue = getVeedQueue();
+    const health = await queue.getHealth();
+    res.json(health);
   } catch (error) {
     res.json({
       available: false,
       authenticated: false,
       browserConnected: false,
-      initializing: veedInitializing,
+      initializing: false,
       error: error.message,
     });
   }
@@ -876,15 +851,12 @@ app.get('/api/veed/health', async (req, res) => {
 // Initialize Veed service manually
 app.post('/api/veed/init', async (req, res) => {
   try {
-    if (veedServiceReady) {
-      return res.json({ success: true, message: 'Veed service already initialized' });
-    }
-
-    await initializeVeedService();
+    const queue = getVeedQueue();
+    const ready = await queue.initializeService();
 
     res.json({
-      success: veedServiceReady,
-      message: veedServiceReady ? 'Veed service initialized' : 'Failed to initialize',
+      success: ready,
+      message: ready ? 'Veed service initialized' : 'Failed to initialize',
     });
   } catch (error) {
     res.status(500).json({
@@ -894,7 +866,7 @@ app.post('/api/veed/init', async (req, res) => {
   }
 });
 
-// Generate video from image using Veed.io
+// Generate video from image using Veed.io (queue-based, returns immediately with operationId)
 app.post('/api/veed/generate', async (req, res) => {
   try {
     const { imageUrl, prompt, aspectRatio, duration } = req.body;
@@ -907,35 +879,105 @@ app.post('/api/veed/generate', async (req, res) => {
       return res.status(400).json({ success: false, error: 'prompt is required' });
     }
 
-    // Initialize service if needed
-    if (!veedServiceReady) {
-      console.log('Veed service not ready, initializing...');
-      await initializeVeedService();
+    const queue = getVeedQueue();
 
-      if (!veedServiceReady) {
-        return res.status(503).json({
-          success: false,
-          error: 'Veed service not available. Check authentication.',
-        });
-      }
-    }
-
-    const service = await getVeedService();
-    const result = await service.generateVideo(imageUrl, prompt, { aspectRatio, duration });
-
-    // Return local URL for serving the video
-    const localVideoUrl = result.localPath
-      ? `http://localhost:${PORT}${result.localPath}`
-      : result.videoUrl;
+    // Enqueue the request - returns immediately
+    const queueResult = await queue.enqueue(imageUrl, prompt, { aspectRatio, duration });
 
     res.json({
       success: true,
-      videoUrl: localVideoUrl,
-      cdnUrl: result.videoUrl,
+      queued: true,
+      operationId: queueResult.operationId,
+      status: queueResult.status,
+      position: queueResult.position,
+      queueLength: queueResult.queueLength,
+      message: `Request queued. Poll /api/veed/status/${queueResult.operationId} for updates.`,
     });
 
   } catch (error) {
     console.error('Veed generate error:', error);
+    res.status(500).json({
+      success: false,
+      error: error.message,
+    });
+  }
+});
+
+// Get status of a specific operation
+app.get('/api/veed/status/:operationId', async (req, res) => {
+  try {
+    const { operationId } = req.params;
+    const queue = getVeedQueue();
+    const status = queue.getStatus(operationId);
+
+    if (!status) {
+      return res.status(404).json({
+        success: false,
+        error: 'Operation not found',
+      });
+    }
+
+    // If completed, include the video URL
+    let response = {
+      success: true,
+      ...status,
+    };
+
+    if (status.status === OperationStatus.COMPLETED && status.result) {
+      const localVideoUrl = status.result.localPath
+        ? `http://localhost:${PORT}${status.result.localPath}`
+        : status.result.videoUrl;
+
+      response.videoUrl = localVideoUrl;
+      response.cdnUrl = status.result.videoUrl;
+    }
+
+    res.json(response);
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      error: error.message,
+    });
+  }
+});
+
+// Get queue status (all operations)
+app.get('/api/veed/queue', async (req, res) => {
+  try {
+    const queue = getVeedQueue();
+    const status = queue.getAllStatus();
+
+    res.json({
+      success: true,
+      ...status,
+    });
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      error: error.message,
+    });
+  }
+});
+
+// Cancel a queued operation
+app.delete('/api/veed/cancel/:operationId', async (req, res) => {
+  try {
+    const { operationId } = req.params;
+    const queue = getVeedQueue();
+    const result = queue.cancel(operationId);
+
+    if (!result.success) {
+      return res.status(400).json({
+        success: false,
+        error: result.error,
+      });
+    }
+
+    res.json({
+      success: true,
+      message: 'Operation cancelled',
+    });
+  } catch (error) {
     res.status(500).json({
       success: false,
       error: error.message,
