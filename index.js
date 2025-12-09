@@ -8,6 +8,15 @@ import { GoogleGenAI } from '@google/genai';
 import { getVeedService, initVeedService } from './veed-service.js';
 import { getVeedQueue, OperationStatus } from './veed-queue.js';
 
+// Global error handlers to prevent server from crashing
+process.on('uncaughtException', (err) => {
+  console.error('Uncaught Exception:', err);
+});
+
+process.on('unhandledRejection', (reason, promise) => {
+  console.error('Unhandled Rejection at:', promise, 'reason:', reason);
+});
+
 const app = express();
 app.use(cors());
 app.use(express.json());
@@ -1166,10 +1175,29 @@ app.get('/api/audius/health', (req, res) => {
 const PORT = process.env.PORT || process.env.API_PORT || 3001;
 const HOST = process.env.API_HOST || 'localhost';
 
-app.listen(PORT, () => {
+const server = app.listen(PORT, () => {
   console.log(`API server running on http://${HOST}:${PORT}`);
   console.log(`Anthropic API: ${ANTHROPIC_API_KEY ? 'configured' : 'NOT SET'}`);
   console.log(`OpenSea MCP: ${OPENSEA_BEARER_TOKEN ? 'configured' : 'NOT SET'}`);
   console.log(`Google Veo API: ${GOOGLE_API_KEY ? 'configured' : 'NOT SET'}`);
   console.log(`Veed.io: available (POST /api/veed/init to initialize)`);
+});
+
+server.on('error', (err) => {
+  console.error('Server error:', err);
+  if (err.code === 'EADDRINUSE') {
+    console.error(`Port ${PORT} is already in use`);
+  }
+});
+
+// Keep the process alive
+process.on('SIGINT', () => {
+  console.log('Shutting down server...');
+  server.close(() => {
+    process.exit(0);
+  });
+});
+
+process.on('exit', (code) => {
+  console.log(`Process exiting with code: ${code}`);
 });
